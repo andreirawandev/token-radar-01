@@ -1,4 +1,4 @@
-// Token Radar's value model (radar-2-comps): one snapshot in, one ranked board out.
+// Token Radar's value model (radar-3-comps): one snapshot in, one ranked board out.
 //
 // The board ranks every protocol that passes the house's own pre-token test — the
 // watchlist's rule, minus its $50M floor — so the board is the 40 watchlist rows plus
@@ -10,9 +10,24 @@
 // Implied value is comps-calibrated, computed from the snapshot at run time — no
 // protocol name is ever special-cased and no multiple is hard-coded:
 //
-//   comp     = the median market-cap / TVL of the live-token protocols in the same
-//              category (at least 3 comparables, else the whole-market median),
-//              clamped to [0.05, 0.60]
+//   median   = the median market-cap / TVL of the live-token protocols in the same
+//              category (the category's own signal, however thin it is)
+//   comp     = (n x clamp(median) + 3 x global) / (n + 3), clamped to [0.05, 0.60]
+//              — a shrinkage blend: a category with many live peers is priced by
+//              its own median, a category with one or two peers is pulled toward
+//              the whole-market median, and a category with no live peer at all is
+//              priced at the market median. The old model threw thin categories
+//              away entirely (any category under 3 peers got the market median),
+//              which mis-priced the board's biggest rows: the two live Onchain
+//              Capital Allocator peers both sit above $1B of TVL and trade near
+//              0.01x TVL, yet Veda and Upshift were priced at the 0.21x market
+//              median — seventeen times their own category. The blend fixes that
+//              without letting one thin peer set a price: a single peer's median is
+//              clamped to the model's own band first, so even a 400x peer (one live
+//              prediction-market token on $6.6M of TVL) can only pull its category
+//              to 0.31x, never to the 0.60 cap on its own.
+//   global   = the median market-cap / TVL of every live-token protocol, clamped
+//              to [0.05, 0.60]
 //   base     = tvl_usd x comp
 //   growth   = 1 + 0.6 x clamp(change_7d, -50, +100) / 100        -> [0.70, 1.60]
 //   maturity = 0.75 + 0.25 x min(age_days, 1095) / 1095           -> [0.75, 1.00]
@@ -55,7 +70,7 @@ export interface Snapshot {
 export interface ModelConstants {
   comp_floor: number;
   comp_cap: number;
-  comp_min_n: number;
+  shrink_k: number;
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
@@ -70,7 +85,7 @@ export interface ModelConstants {
 export const MODEL: ModelConstants = {
   comp_floor: 0.05,
   comp_cap: 0.6,
-  comp_min_n: 3,
+  shrink_k: 3,
   growth_weight: 0.6,
   growth_floor: -50,
   growth_cap: 100,
@@ -83,7 +98,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2-comps';
+export const MODEL_VERSION = 'radar-3-comps';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -92,6 +107,7 @@ export const LIVE_ROWS = 24;
 export interface CategoryComp {
   category: string;
   multiple: number;
+  median: number;
   comps_n: number;
   fallback: boolean;
 }
@@ -123,6 +139,7 @@ export interface BoardRow {
     comp_multiple: number;
     comp_category: string;
     comp_n: number;
+    comp_median: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -146,6 +163,7 @@ export interface RadarRow {
   age_days: number | null;
   implied_value_usd: number;
   comp_multiple: number;
+  comp_median: number;
   comp_n: number;
   watchlist: boolean;
   growth_multiplier: number;
@@ -166,6 +184,13 @@ export interface LiveRow {
   mcap_tvl: number | null;
 }
 
+/** One live-token peer: the name and market-cap / TVL the detail view shows. */
+export interface CompPeer {
+  slug: string;
+  name: string;
+  mcap_tvl: number;
+}
+
 /** Everything the dashboard needs: the board, the live set, the comps, and the model it runs. */
 export interface RadarData {
   as_of: string;
@@ -173,11 +198,13 @@ export interface RadarData {
   floor_usd: number;
   model: ModelConstants;
   model_version: string;
+  global_median: number;
   watchlist_size: number;
   board_size: number;
   early_size: number;
   live_size: number;
   comps: CategoryComp[];
+  comp_peers: Record<string, CompPeer[]>;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -216,7 +243,13 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** The comparables: one median market-cap / TVL per category, from the live-token protocols. */
+/**
+ * The comparables: one shrunk market-cap / TVL multiple per category, from the
+ * live-token protocols. The category's own median is clamped to the model's band
+ * first, then blended toward the whole-market median with a pseudo-count of
+ * `shrink_k` market observations: many peers, the category speaks; one peer, the
+ * market speaks louder; no peer at all, the market median is the multiple.
+ */
 export function categoryComps(snapshot: Snapshot, model: ModelConstants = MODEL): { byCategory: Map<string, CategoryComp>; global: number } {
   const live = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
   const globalRaw = median(live.map((p) => p.mcap_usd! / p.tvl_usd), 0.17);
@@ -228,15 +261,17 @@ export function categoryComps(snapshot: Snapshot, model: ModelConstants = MODEL)
     list.push(p.mcap_usd! / p.tvl_usd);
     byCategory.set(key, list);
   }
+  const clamp = (n: number): number => Math.min(model.comp_cap, Math.max(model.comp_floor, n));
   const out = new Map<string, CategoryComp>();
   for (const [category, ratios] of byCategory) {
-    const fallback = ratios.length < model.comp_min_n;
-    const raw = fallback ? globalRaw : median(ratios, globalRaw);
+    const rawMedian = median(ratios, globalRaw);
+    const shrunk = (ratios.length * clamp(rawMedian) + model.shrink_k * global) / (ratios.length + model.shrink_k);
     out.set(category, {
       category,
-      multiple: round4(Math.min(model.comp_cap, Math.max(model.comp_floor, raw))),
+      multiple: round4(clamp(shrunk)),
+      median: round4(rawMedian),
       comps_n: ratios.length,
-      fallback,
+      fallback: false,
     });
   }
   return { byCategory: out, global };
@@ -246,7 +281,7 @@ export function categoryComps(snapshot: Snapshot, model: ModelConstants = MODEL)
 export function compFor(p: SnapshotProtocol, comps: { byCategory: Map<string, CategoryComp>; global: number }): CategoryComp {
   const found = comps.byCategory.get(p.category ?? 'Other');
   if (found !== undefined) return found;
-  return { category: p.category ?? 'Other', multiple: comps.global, comps_n: 0, fallback: true };
+  return { category: p.category ?? 'Other', multiple: comps.global, median: comps.global, comps_n: 0, fallback: true };
 }
 
 /** The four multipliers and the implied value one protocol gets under `model`. */
@@ -344,6 +379,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       comp_multiple: s.comp.multiple,
       comp_category: s.comp.category,
       comp_n: s.comp.comps_n,
+      comp_median: s.comp.median,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -494,6 +530,7 @@ export function radarRow(row: BoardRow, onWatchlist: boolean): RadarRow {
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     comp_multiple: row.model.comp_multiple,
+    comp_median: row.model.comp_median,
     comp_n: row.model.comp_n,
     watchlist: onWatchlist,
     growth_multiplier: row.model.growth_multiplier,
@@ -501,6 +538,27 @@ export function radarRow(row: BoardRow, onWatchlist: boolean): RadarRow {
     breadth_multiplier: row.model.breadth_multiplier,
     farm_steps: row.farm_steps,
   };
+}
+
+/**
+ * The peers that set each category's multiple: the live-token protocols whose
+ * market-cap / TVL sits closest to the category median, up to three, so the
+ * detail view can name the peers behind the number instead of the largest
+ * live tokens in the category. Deterministic: ties break by slug.
+ */
+export function compPeers(snapshot: Snapshot, comps: { byCategory: Map<string, CategoryComp>; global: number }): Record<string, CompPeer[]> {
+  const live = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const out: Record<string, CompPeer[]> = {};
+  for (const [category, comp] of comps.byCategory) {
+    const peers = live
+      .filter((p) => (p.category ?? 'Other') === category)
+      .map((p) => ({ slug: p.slug, name: p.name, mcap_tvl: round4(p.mcap_usd! / p.tvl_usd), gap: Math.abs(p.mcap_usd! / p.tvl_usd - comp.median) }))
+      .sort((a, b) => a.gap - b.gap || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
+      .slice(0, 3)
+      .map(({ slug, name, mcap_tvl }) => ({ slug, name, mcap_tvl }));
+    out[category] = peers;
+  }
+  return out;
 }
 
 /** Everything the dashboard renders, from the snapshot. */
@@ -516,11 +574,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
+    global_median: comps.global,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
     live_size: live.length,
     comps: compList,
+    comp_peers: compPeers(snapshot, comps),
     rows: board.map((r) => radarRow(r, snapshot.watchlist.includes(r.slug))),
     live,
   };

@@ -3,15 +3,17 @@
 // view with the model's own inputs and the protocol's farm plan, and the live-token
 // set the board is kept apart from. No network: every byte it shows is in data.js.
 //
-// The value model, radar-2-comps, in one function — impliedOf below recomputes a
+// The value model, radar-3-comps, in one function — impliedOf below recomputes a
 // row from the snapshot figures and checks the number board.json carries, so the
 // page's code and the board's data are visibly the same arithmetic:
 //
 //   implied = round(tvl_usd x comp x growth x maturity x breadth)
-//   comp     = median market-cap / TVL of the live-token protocols in the same
-//              category (3+ comparables, else the whole-market median), clamped
-//              to [0.05, 0.60] — computed from the snapshot at run time, never a
-//              hard-coded list of names
+//   comp     = (n x clamp(category median mcap/TVL) + 3 x market median) / (n + 3),
+//              clamped to [0.05, 0.60] — a shrinkage blend: many live peers and
+//              the category's own median sets the price; one or two peers and the
+//              market median pulls it back; no peer at all and it is the market
+//              median. The category median is clamped first, so a single thin
+//              peer can never push a category to the cap on its own.
 //   growth   = 1 + 0.6 x clamp(change_7d, -50, +100) / 100
 //   maturity = 0.75 + 0.25 x min(age_days, 1095) / 1095 (unknown age: 365 days)
 //   breadth  = 1 + 0.03 x min(chains - 1, 5)
@@ -143,10 +145,15 @@
   function lede() {
     var top = DATA.rows[0];
     var totalImplied = DATA.rows.reduce(function (n, r) { return n + r.implied_value_usd; }, 0);
+    var top3 = DATA.rows.slice(0, 3).reduce(function (n, r) { return n + r.implied_value_usd; }, 0);
+    var byCat = {};
+    DATA.rows.forEach(function (r) { var c = r.category || 'Other'; byCat[c] = (byCat[c] || 0) + r.implied_value_usd; });
+    var topCat = Object.keys(byCat).sort(function (a, b) { return byCat[b] - byCat[a]; })[0];
     return el('section', { class: 'lede' },
       el('div', null,
         el('h1', { text: 'Which pre-token protocol is worth farming next?' }),
-        el('p', null, 'The watchlist is the floor: every protocol with at least ', el('b', { text: '$' + Math.round(DATA.floor_usd / 1e6) + 'M' }), ' of TVL and no token on record — ', el('b', { text: String(DATA.watchlist_size) }), ' of them. The early radar adds ', el('b', { text: String(DATA.early_size) }), ' more that pass the same pre-token test — most of them below that floor, a few above it that the watchlist leaves out. Each row is ranked by what its launch would be worth if its record stayed as it is — a model, not a promise, and never a prediction of whether or when a token is issued.')
+        el('p', null, 'The watchlist is the floor: every protocol with at least ', el('b', { text: '$' + Math.round(DATA.floor_usd / 1e6) + 'M' }), ' of TVL and no token on record — ', el('b', { text: String(DATA.watchlist_size) }), ' of them. The early radar adds ', el('b', { text: String(DATA.early_size) }), ' more that pass the same pre-token test — most of them below that floor, a few above it that the watchlist leaves out. Each row is ranked by what its launch would be worth if its record stayed as it is — a model, not a promise, and never a prediction of whether or when a token is issued.'),
+        el('p', { class: 'insight' }, 'The board is concentrated: the top 3 rows hold ', el('b', { text: Math.round((top3 / totalImplied) * 100) + '%' }), ' of the combined implied value, and ', el('b', { text: topCat }), ' alone holds ', el('b', { text: Math.round(((byCat[topCat] || 0) / totalImplied) * 100) + '%' }), ' — the radar is a bet on the largest pre-token protocols, not a spread across hundreds of small ones.')
       ),
       el('div', { class: 'kpis' },
         el('div', { class: 'kpi' }, el('b', { text: String(DATA.board_size) }), el('span', { text: 'pre-token rows ranked' })),
@@ -229,7 +236,10 @@
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
         )),
-        el('td', null, el('span', { class: 'badge ' + (r.watchlist ? 'watch' : 'early'), text: r.watchlist ? 'watchlist' : 'early' }))
+        el('td', null, el('div', { class: 'badges' },
+          r.rank === 1 ? el('span', { class: 'badge top', text: 'top pick' }) : null,
+          el('span', { class: 'badge ' + (r.watchlist ? 'watch' : 'early'), text: r.watchlist ? 'watchlist' : 'early' })
+        ))
       );
       tbody.appendChild(tr);
     });
@@ -281,7 +291,11 @@
     if (!row) return null;
     var recomputed = impliedOf(row, DATA.model);
     var match = recomputed === row.implied_value_usd;
-    var comps = DATA.live.filter(function (r) { return r.category === row.category; }).slice(0, 3);
+    var peers = (DATA.comp_peers && DATA.comp_peers[row.category || 'Other']) || [];
+    var idx = -1;
+    for (var i = 0; i < DATA.rows.length; i++) if (DATA.rows[i].slug === row.slug) idx = i;
+    var prev = idx > 0 ? DATA.rows[idx - 1] : null;
+    var next = idx >= 0 && idx < DATA.rows.length - 1 ? DATA.rows[idx + 1] : null;
     var steps = row.farm_steps.map(function (s) {
       var at = s.indexOf(' Cost: ');
       var action = at >= 0 ? s.slice(0, at) : s;
@@ -312,7 +326,9 @@
           el('h3', { text: 'How the value is built' }),
           el('div', { class: 'equation' },
             el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-            el('div', null, el('span', { text: 'Comp multiple (' + (row.category || 'Other') + ', ' + row.comp_n + ' live comp' + (row.comp_n === 1 ? '' : 's') + ')' }), el('b', { class: 'num', text: fmtMult(row.comp_multiple) })),
+            el('div', null, el('span', { text: 'Category median (' + (row.category || 'Other') + ', ' + row.comp_n + ' live peer' + (row.comp_n === 1 ? '' : 's') + ')' }), el('b', { class: 'num', text: row.comp_n === 0 ? 'n/a' : fmtMult(row.comp_median) })),
+            el('div', null, el('span', { text: 'Market median (all live tokens)' }), el('b', { class: 'num', text: fmtMult(DATA.global_median) })),
+            el('div', null, el('span', { text: 'Comp multiple (shrunk toward the market)' }), el('b', { class: 'num', text: fmtMult(row.comp_multiple) })),
             el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
             el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: fmtMult(row.growth_multiplier) })),
             el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
@@ -320,17 +336,28 @@
             el('div', null, el('span', { text: 'Chain breadth (' + (row.chains || []).length + ' chains)' }), el('b', { class: 'num', text: fmtMult(row.breadth_multiplier) })),
             el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
           ),
-          el('p', { class: 'note', text: 'The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ' — the same number board.json carries.' : ' — which differs from the board: the data would be stale.') + ' The multiple comes from live tokens in the same category, so a lending protocol is priced like lending, not like a DEX.' }),
-          comps.length ? el('div', { class: 'comps' },
-            el('div', null, el('span', { text: 'Live comparables in ' + (row.category || 'Other') }), el('b', { class: 'num', text: 'Mcap / TVL' })),
-            comps.map(function (c) { return el('div', null, el('span', { text: c.name }), el('b', { class: 'num', text: c.mcap_tvl === null ? 'n/a' : fmtMult(c.mcap_tvl) })); })
-          ) : null
+          el('p', { class: 'note', text: 'The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ' — the same number board.json carries.' : ' — which differs from the board: the data would be stale.') + ' The multiple blends the category median toward the market median, so a category with one thin peer cannot set its own price — and a category with many peers is priced by them.' }),
+          peers.length ? el('div', { class: 'comps' },
+            el('div', null, el('span', { text: 'Live peers nearest this category\u2019s median' }), el('b', { class: 'num', text: 'Mcap / TVL' })),
+            peers.map(function (c) { return el('div', null, el('span', { text: c.name }), el('b', { class: 'num', text: fmtMult(c.mcap_tvl) })); })
+          ) : el('p', { class: 'note', text: 'No live-token peer in this category — the row is priced at the market median.' }),
         ),
         el('div', { class: 'detail-col' },
           el('h3', { text: 'Farm plan — what to do, what it costs, how long it takes' }),
           el('ol', { class: 'steps' }, steps),
           el('p', { class: 'note', text: 'Never pay anyone to claim for you, and never connect a wallet holding funds you cannot afford to lose. Implied value is an estimate, not a price.' })
         )
+      ),
+      el('div', { class: 'neighbours' },
+        el('span', { class: 'sub', text: 'Around this rank' }),
+        prev ? el('button', { class: 'button neighbour', type: 'button', onclick: function () { openDetail(prev.slug); } },
+          el('span', { class: 'num', text: '#' + prev.rank + ' · ' + prev.name }),
+          el('b', { class: 'num', text: fmtUsd(prev.implied_value_usd) })
+        ) : el('span', { class: 'sub', text: 'Top of the board — nothing above it' }),
+        next ? el('button', { class: 'button neighbour', type: 'button', onclick: function () { openDetail(next.slug); } },
+          el('span', { class: 'num', text: '#' + next.rank + ' · ' + next.name }),
+          el('b', { class: 'num', text: fmtUsd(next.implied_value_usd) })
+        ) : el('span', { class: 'sub', text: 'Bottom of the board — nothing below it' })
       )
     );
   }
@@ -338,12 +365,17 @@
   function modelPanel() {
     var m = DATA.model;
     var topComps = DATA.comps.slice(0, 8);
+    var totalImplied = DATA.rows.reduce(function (n, r) { return n + r.implied_value_usd; }, 0);
+    var byCat = {};
+    DATA.rows.forEach(function (r) { var c = r.category || 'Other'; byCat[c] = (byCat[c] || 0) + r.implied_value_usd; });
+    var topCats = Object.keys(byCat).sort(function (a, b) { return byCat[b] - byCat[a]; }).slice(0, 6);
+    var catMax = byCat[topCats[0]] || 1;
     return el('section', { class: 'panel model' },
-      el('h2', { text: 'How implied value is computed — radar-2-comps' }),
+      el('h2', { text: 'How implied value is computed — ' + DATA.model_version }),
       el('p', { class: 'sub', text: 'One function scores every row from the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
         el('div', null, el('b', { text: 'implied = round( tvl_usd x comp x growth x maturity x breadth )' })),
-        el('div', { text: 'comp     = median mcap / TVL of live tokens in the category (3+ comps, else market median), clamped [0.05, 0.60]' }),
+        el('div', { text: 'comp     = (n x clamp(category median mcap / TVL) + ' + m.shrink_k + ' x market median) / (n + ' + m.shrink_k + '), clamped [0.05, 0.60] — many peers, the category speaks; one peer, the market speaks louder' }),
         el('div', { text: 'growth   = 1 + 0.6 x clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100' }),
         el('div', { text: 'maturity = ' + m.maturity_floor + ' + ' + m.maturity_range + ' x min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + '   (unknown age: ' + m.unknown_age_days + ' days)' }),
         el('div', { text: 'breadth  = 1 + 0.03 x min(chains - 1, 5)' })
@@ -352,16 +384,26 @@
         el('div', null,
           el('h3', { text: 'Top category multiples' }),
           el('table', { class: 'comps-table' },
-            el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Multiple' }), el('th', { scope: 'col', text: 'Comps' }))),
+            el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Median' }), el('th', { scope: 'col', text: 'Multiple' }), el('th', { scope: 'col', text: 'Peers' }))),
             el('tbody', null, topComps.map(function (c) {
-              return el('tr', null, el('td', { text: c.category }), el('td', { class: 'num', text: fmtMult(c.multiple) }), el('td', { class: 'num', text: String(c.comps_n) + (c.fallback ? ' (market)' : '') }));
+              return el('tr', null, el('td', { text: c.category }), el('td', { class: 'num', text: fmtMult(c.median) }), el('td', { class: 'num', text: fmtMult(c.multiple) }), el('td', { class: 'num', text: String(c.comps_n) + (c.fallback ? ' (market)' : '') }));
             }))
           )
         ),
         el('div', null,
-          el('h3', { text: 'What the board is — and is not' }),
-          el('p', { class: 'sub', text: 'The board ranks protocols that record no token and pass the watchlist\u2019s product test, at any TVL. It does not predict whether or when a token is issued: a protocol on the list may still have a token its DefiLlama record does not carry. Live-token protocols are priced by the market and kept out of the ranking, where they set the multiples instead.' })
+          el('h3', { text: 'Where the implied value sits' }),
+          el('div', { class: 'catbars' }, topCats.map(function (c) {
+            return el('div', { class: 'catbar' },
+              el('span', { text: c }),
+              el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((byCat[c] / catMax) * 100)) + '%' })),
+              el('b', { class: 'num', text: fmtUsd(byCat[c]) + ' · ' + Math.round((byCat[c] / totalImplied) * 100) + '%' }));
+          })),
+          el('p', { class: 'sub', text: 'Implied value by category — the top six of ' + Object.keys(byCat).length + ' categories on the board.' })
         )
+      ),
+      el('div', null,
+        el('h3', { text: 'What the board is — and is not' }),
+        el('p', { class: 'sub', text: 'The board ranks protocols that record no token and pass the watchlist\u2019s product test, at any TVL. It does not predict whether or when a token is issued: a protocol on the list may still have a token its DefiLlama record does not carry. Live-token protocols are priced by the market and kept out of the ranking, where they set the multiples instead.' })
       )
     );
   }
